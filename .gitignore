@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 backend/data/
-npc-memory/data/
+npc-agent/data/
 frontend/node_modules/
 frontend/dist/
 .DS_Store
