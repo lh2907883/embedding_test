@@ -46,3 +46,30 @@ class SearchMemoriesRequest(BaseModel):
     top_k: int = Field(default=10, ge=1, le=100)
     memory_type: Optional[MemoryType] = None
     related_npc_id: Optional[str] = None
+
+
+class CreateGoalRequest(BaseModel):
+    goal_type: str = "short_term"
+    description: str
+    priority: int = Field(default=5, ge=1, le=10)
+    created_game_time: Optional[str] = None
+    deadline_game_time: Optional[str] = None
+
+
+class UpdateGoalRequest(BaseModel):
+    status: Optional[str] = None
+    priority: Optional[int] = Field(default=None, ge=1, le=10)
+    description: Optional[str] = None
+    deadline_game_time: Optional[str] = None
+
+
+class GoalResponse(BaseModel):
+    goal_id: str
+    npc_id: str
+    goal_type: str
+    description: str
+    priority: int
+    status: str
+    created_game_time: Optional[str] = None
+    deadline_game_time: Optional[str] = None
+    created_at: str

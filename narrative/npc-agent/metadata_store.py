@@ -23,6 +23,17 @@ class MetadataStore:
                 location    TEXT,
                 created_at  TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS npc_goals (
+                goal_id             TEXT PRIMARY KEY,
+                npc_id              TEXT NOT NULL REFERENCES npcs(npc_id) ON DELETE CASCADE,
+                goal_type           TEXT NOT NULL DEFAULT 'short_term',
+                description         TEXT NOT NULL,
+                priority            INTEGER NOT NULL DEFAULT 5,
+                status              TEXT NOT NULL DEFAULT 'active',
+                created_game_time   TEXT,
+                deadline_game_time  TEXT,
+                created_at          TEXT NOT NULL
+            );
         """)
         self.conn.commit()
 
@@ -75,6 +86,57 @@ class MetadataStore:
 
     def delete_npc(self, npc_id: str) -> bool:
         cursor = self.conn.execute("DELETE FROM npcs WHERE npc_id = ?", (npc_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    # ── 目标管理 ──
+
+    def create_goal(self, goal_id: str, npc_id: str, goal_type: str, description: str,
+                    priority: int, created_game_time: str | None, deadline_game_time: str | None) -> dict:
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            """INSERT INTO npc_goals
+               (goal_id, npc_id, goal_type, description, priority, status, created_game_time, deadline_game_time, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (goal_id, npc_id, goal_type, description, priority, "active", created_game_time, deadline_game_time, now),
+        )
+        self.conn.commit()
+        return {"goal_id": goal_id, "npc_id": npc_id, "goal_type": goal_type,
+                "description": description, "priority": priority, "status": "active",
+                "created_game_time": created_game_time, "deadline_game_time": deadline_game_time, "created_at": now}
+
+    def list_goals(self, npc_id: str, status: str | None = "active") -> list[dict]:
+        if status:
+            rows = self.conn.execute(
+                "SELECT * FROM npc_goals WHERE npc_id = ? AND status = ? ORDER BY priority DESC",
+                (npc_id, status),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM npc_goals WHERE npc_id = ? ORDER BY priority DESC",
+                (npc_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_goal(self, goal_id: str, **kwargs) -> dict | None:
+        row = self.conn.execute("SELECT * FROM npc_goals WHERE goal_id = ?", (goal_id,)).fetchone()
+        if not row:
+            return None
+        updates = []
+        values = []
+        for key in ("status", "priority", "description", "deadline_game_time"):
+            if key in kwargs and kwargs[key] is not None:
+                updates.append(f"{key} = ?")
+                values.append(kwargs[key])
+        if updates:
+            values.append(goal_id)
+            self.conn.execute(f"UPDATE npc_goals SET {', '.join(updates)} WHERE goal_id = ?", values)
+            self.conn.commit()
+        row = self.conn.execute("SELECT * FROM npc_goals WHERE goal_id = ?", (goal_id,)).fetchone()
+        return dict(row) if row else None
+
+    def delete_goal(self, goal_id: str) -> bool:
+        cursor = self.conn.execute("DELETE FROM npc_goals WHERE goal_id = ?", (goal_id,))
         self.conn.commit()
         return cursor.rowcount > 0
 

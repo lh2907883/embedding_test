@@ -10,6 +10,7 @@ from npc_memory_manager import NpcMemoryManager
 from api_models import (
     CreateNpcRequest, UpdateNpcRequest, NpcResponse,
     AddMemoryRequest, SearchMemoriesRequest,
+    CreateGoalRequest, UpdateGoalRequest, GoalResponse,
 )
 from models import MemoryEntry, MemorySearchResult
 
@@ -115,4 +116,40 @@ def search_memories(npc_id: str, req: SearchMemoriesRequest):
 def delete_memory(npc_id: str, memory_id: str):
     _check_npc(npc_id)
     app.state.manager.delete_memory(memory_id)
+    return {"ok": True}
+
+
+# ── 目标管理 ──
+
+@app.post("/api/npcs/{npc_id}/goals", response_model=GoalResponse)
+def create_goal(npc_id: str, req: CreateGoalRequest):
+    _check_npc(npc_id)
+    import uuid
+    goal_id = str(uuid.uuid4())[:8]
+    return app.state.metadata.create_goal(
+        goal_id, npc_id, req.goal_type, req.description,
+        req.priority, req.created_game_time, req.deadline_game_time,
+    )
+
+
+@app.get("/api/npcs/{npc_id}/goals", response_model=list[GoalResponse])
+def list_goals(npc_id: str, status: str | None = "active"):
+    _check_npc(npc_id)
+    return app.state.metadata.list_goals(npc_id, status=status)
+
+
+@app.put("/api/npcs/{npc_id}/goals/{goal_id}", response_model=GoalResponse)
+def update_goal(npc_id: str, goal_id: str, req: UpdateGoalRequest):
+    _check_npc(npc_id)
+    goal = app.state.metadata.update_goal(goal_id, **req.model_dump(exclude_none=True))
+    if not goal:
+        raise HTTPException(404, f"目标 {goal_id} 不存在")
+    return goal
+
+
+@app.delete("/api/npcs/{npc_id}/goals/{goal_id}")
+def delete_goal(npc_id: str, goal_id: str):
+    _check_npc(npc_id)
+    if not app.state.metadata.delete_goal(goal_id):
+        raise HTTPException(404, f"目标 {goal_id} 不存在")
     return {"ok": True}
