@@ -1,28 +1,25 @@
 import json
-import anthropic
-from config import ANTHROPIC_API_KEY, LLM_MODEL
+from openai import OpenAI
+from config import DEEPSEEK_API_KEY, LLM_BASE_URL, LLM_MODEL
 
 
 class LlmService:
-    def __init__(self, api_key: str = ANTHROPIC_API_KEY, model: str = LLM_MODEL):
-        self.client = anthropic.Anthropic(api_key=api_key)
+    def __init__(self, api_key: str = DEEPSEEK_API_KEY, base_url: str = LLM_BASE_URL, model: str = LLM_MODEL):
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
 
     def decide(self, system_prompt: str, user_prompt: str) -> dict:
-        resp = self.client.messages.create(
+        resp = self.client.chat.completions.create(
             model=self.model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
             temperature=0.8,
         )
-        content = resp.content[0].text
-        # 提取 JSON（处理可能的 markdown 包裹）
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-        return json.loads(content.strip())
+        content = resp.choices[0].message.content
+        return json.loads(content)
 
     def close(self):
         pass

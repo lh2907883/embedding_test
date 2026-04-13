@@ -1,6 +1,10 @@
 """
 测试场景：学校走廊冲突
 
+两个测试场景：
+  场景 1: 纯情境 — 放学后走廊相遇，LLM 自主推演
+  场景 2: 预设事件 — 强制"张暴推李怯"，看其他人反应
+
 使用方法：
   终端1: cd narrative && uvicorn app:app --port 8001
   终端2: cd narrative && python tests/test_fight.py
@@ -12,7 +16,6 @@ BASE = "http://localhost:8001/api"
 
 
 def reset():
-    """删除所有 NPC（级联删除记忆和目标）"""
     npcs = requests.get(f"{BASE}/npcs").json()
     for npc in npcs:
         requests.delete(f"{BASE}/npcs/{npc['npc_id']}")
@@ -28,32 +31,36 @@ def create_npc(npc_id, name, personality, traits, location):
     print(f"创建 NPC: {name}({npc_id}) — {r.status_code}")
 
 
-def inject_event(description, location, intensity, involved, game_time):
+def simulate_scene(description, location, characters, intensity, game_time, preset_event=None):
     print(f"\n{'='*60}")
-    print(f"注入事件 (时间={game_time}s): {description}")
+    print(f"场景: {description}")
+    if preset_event:
+        print(f"预设事件: {preset_event['description']}")
     print(f"{'='*60}\n")
 
-    r = requests.post(f"{BASE}/events/inject", json={
+    payload = {
         "description": description,
         "location": location,
+        "characters": characters,
         "intensity": intensity,
-        "involved_npc_ids": involved,
         "game_time": game_time,
-    })
+    }
+    if preset_event:
+        payload["preset_event"] = preset_event
 
+    r = requests.post(f"{BASE}/scenes/simulate", json=payload)
     if r.status_code != 200:
         print(f"错误: {r.status_code} — {r.text}")
         return
 
     result = r.json()
-
     for rnd in result["rounds"]:
-        print(f"\n--- 第 {rnd['round']} 轮 | 事件: {rnd['event_description'][:60]} ---")
+        print(f"\n--- 第 {rnd['round']} 轮 ---")
         for d in rnd["decisions"]:
             print(f"  [{d['npc_name']}] {d['action']}")
             if d.get("new_events"):
                 for ne in d["new_events"]:
-                    print(f"    → 新事件: {ne.get('description', '')}")
+                    print(f"    → {ne.get('description', '')}")
 
     print(f"\n共 {len(result['rounds'])} 轮, {result['total_decisions']} 次决策")
 
@@ -67,9 +74,8 @@ def show_memories(npc_id, npc_name):
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("测试：学校走廊冲突")
-    print("=" * 60)
+    import sys
+    scenario = sys.argv[1] if len(sys.argv) > 1 else "1"
 
     reset()
 
@@ -77,16 +83,32 @@ if __name__ == "__main__":
     create_npc("b", "李怯", "胆小怕事，遇到冲突第一反应是逃跑或求助", {"brave": 0.1, "cautious": 0.9}, "学校")
     create_npc("c", "王正", "正义感强，看不得欺凌弱小，会主动劝架或保护弱者", {"justice": 0.9, "brave": 0.7}, "学校")
 
-    inject_event(
-        description="张暴在学校走廊拦住李怯，大声辱骂他并推了他一把",
-        location="学校",
-        intensity=1.0,
-        involved=["a", "b"],
-        game_time=0,
-    )
+    if scenario == "1":
+        print("\n>>> 场景 1: 纯情境 — LLM 自主推演 <<<")
+        simulate_scene(
+            description="放学后的学校走廊，张暴和李怯迎面相遇，往常张暴就喜欢欺负李怯",
+            location="学校",
+            characters=["a", "b"],
+            intensity=1.0,
+            game_time=0,
+        )
+    else:
+        print("\n>>> 场景 2: 预设事件 — 强制'张暴推李怯' <<<")
+        simulate_scene(
+            description="放学后的学校走廊",
+            location="学校",
+            characters=["a", "b"],
+            intensity=1.0,
+            game_time=0,
+            preset_event={
+                "description": "张暴推了李怯一把",
+                "actor_npc_id": "a",
+                "affected_npc_ids": ["b"],
+            },
+        )
 
     print(f"\n{'='*60}")
-    print("事件结束后的状态")
+    print("记忆状态")
     print(f"{'='*60}")
     for npc_id, name in [("a", "张暴"), ("b", "李怯"), ("c", "王正")]:
         show_memories(npc_id, name)
