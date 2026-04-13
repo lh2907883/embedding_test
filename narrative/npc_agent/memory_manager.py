@@ -1,8 +1,8 @@
 import uuid
-from models import MemoryEntry, MemorySearchResult, MemoryType
-from api_models import AddMemoryRequest
-from vector_store import VectorStore
-from embedding_service import EmbeddingService
+from shared.models import MemoryEntry, MemorySearchResult, MemoryType
+from npc_agent.api_models import AddMemoryRequest
+from shared.vector_store import VectorStore
+from shared.embedding_service import EmbeddingService
 
 
 class NpcMemoryManager:
@@ -73,7 +73,7 @@ class NpcMemoryManager:
 
     def list_memories(self, npc_id: str, limit: int = 50) -> list[dict]:
         points, _ = self._store.list_memories(npc_id, limit=limit)
-        return [
+        memories = [
             {
                 "memory_id": p.id,
                 "npc_id": p.payload["npc_id"],
@@ -86,6 +86,8 @@ class NpcMemoryManager:
             }
             for p in points
         ]
+        memories.sort(key=lambda m: int(m["game_time"]) if m["game_time"].lstrip("-").isdigit() else 0)
+        return memories
 
     def delete_memory(self, memory_id: str) -> None:
         self._store.delete_memory(memory_id)

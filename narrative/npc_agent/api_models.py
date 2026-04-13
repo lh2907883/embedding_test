@@ -1,7 +1,7 @@
 import uuid
 from pydantic import BaseModel, Field
 from typing import Optional
-from models import MemoryType
+from shared.models import MemoryType
 
 
 class CreateNpcRequest(BaseModel):

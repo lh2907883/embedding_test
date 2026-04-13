@@ -1,6 +1,6 @@
 from qdrant_client import QdrantClient, models
 from config import QDRANT_STORAGE_PATH, COLLECTION_NAME, EMBEDDING_DIMENSION
-from models import MemoryEntry
+from shared.models import MemoryEntry
 
 
 class VectorStore:

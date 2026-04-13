@@ -5,11 +5,11 @@ from enum import Enum
 
 class MemoryType(str, Enum):
     BACKGROUND = "background"
+    AFFECTED = "affected"
     WITNESSED = "witnessed"
     HEARD = "heard"
     ACTION = "action"
     THOUGHT = "thought"
-    RELATIONSHIP = "relationship"
 
 
 class MemoryEntry(BaseModel):
