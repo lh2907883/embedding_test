@@ -12,9 +12,9 @@ Three independent modules sharing a monorepo:
 
 - **backend/** — Multi-tenant vector embedding service (document upload, chunking, semantic search). Port 8000.
 - **frontend/** — Vue 3 + Element Plus UI for backend. Port 5173 (dev).
-- **narrative/npc-agent/** — AI game NPC agent: memory system, goal system, LLM decision engine. Port 8001.
+- **narrative/** — AI game NPC agent: memory system, goal system, scene-driven LLM decision engine. Port 8001. Subdirectories: shared/, npc_agent/, event/, tests/.
 
-backend and narrative/npc-agent are separate FastAPI services with independent Qdrant and SQLite databases. They do not share data or code at runtime.
+backend and narrative are separate FastAPI services with independent Qdrant and SQLite databases. They do not share data or code at runtime.
 
 ## Commands
 
@@ -27,11 +27,12 @@ uvicorn app:app --port 8000 --reload
 
 ### NPC Agent
 ```bash
-cd narrative/npc-agent
+cd narrative
 pip install -r requirements.txt
 uvicorn app:app --port 8001 --reload
-# Test scenario:
-python test_fight.py  # requires service running on 8001
+# Test scenarios:
+python tests/test_fight.py      # pure scene mode
+python tests/test_fight.py 2    # preset event mode
 ```
 
 ### Frontend
@@ -48,28 +49,34 @@ npm run build        # production build to dist/
 Layered: `app.py` (FastAPI endpoints) → `tenant_manager.py` (orchestration) → `vector_store.py` (Qdrant) + `metadata_store.py` (SQLite). Documents are chunked via `chunking_service.py`, embedded via `embedding_service.py` (fastembed), stored in Qdrant with tenant_id payload isolation. Tenant/document metadata in SQLite. File parsing (`file_parser.py`) handles PDF/Word/Excel/TXT.
 
 ### NPC Agent (Narrative System)
+Modular structure: `shared/` (infra), `npc_agent/` (NPC logic), `event/` (scene/decision logic). Main entry: `narrative/app.py`.
+
 Two storage layers: **Qdrant** stores memories (each memory = one vector point, no chunking), **SQLite** stores NPC personality/traits and goals.
 
 Key design decisions:
 - **NPC = tenant** — each NPC's memories are isolated by npc_id payload filter
 - **Memories are structured JSON entries**, not documents. No chunking needed.
-- **Relationships stored as memories** (memory_type: "relationship") with related_npc_ids field, not in a separate table. Relationships change through events.
+- **Memory types**: background, action (I did X), affected (X happened to me), witnessed (I saw X), heard, thought
 - **Emotions not stored** — LLM infers emotional state from personality + recent memories at decision time
-- **Goals stored in SQLite** — they have lifecycle status (active/completed/failed/abandoned), need enumeration not semantic search
+- **Goals stored in SQLite** — only long-term life goals, not immediate reactions
 
-**Decision loop** (`decision_engine.py`): External injects event → find affected NPCs by location + intensity → write witness memories → each NPC calls LLM (personality + goals + relevant memories + event) → LLM outputs structured JSON (action, dialogue, memory_note, new_events, goal_changes) → process output → new_events trigger next round → loop until stable or max rounds.
-
-Event propagation is NPC-driven: the system only handles "who is present", subsequent spreading (who tells who, with what distortion) emerges from NPC decisions.
+**Scene-driven simulation** (`decision_engine.py`):
+- Entry: `POST /api/scenes/simulate` (supports pure scene or preset event)
+- Each round = one LLM call with ALL in-scene NPCs → unified coherent round_event (no contradictions)
+- One round = one **situation change** (not a single action) — merges actions + process + result
+- After all rounds: per-NPC LLM call generates first-person perspective memories
+- Scene descriptions must be objective facts only (no hints, predictions, NPC intentions)
+- Only existing NPCs allowed — LLM cannot invent new characters
 
 ### Embedding Model
 Both services use `intfloat/multilingual-e5-large` (1024 dim) via fastembed (ONNX, no PyTorch). Uses `passage_embed` for documents/memories and `query_embed` for search queries — this distinction is required for cross-lingual retrieval.
 
 ### LLM Integration
-NPC Agent uses Anthropic Claude (Sonnet) via `anthropic` SDK. API key in `narrative/.env`. Config loaded via python-dotenv in `config.py`.
+NPC Agent uses DeepSeek V3 via OpenAI SDK (`api.deepseek.com`). API key in `narrative/.env`. Config loaded via python-dotenv (with `override=True`) in `config.py`.
 
 ## Conventions
 
-- Game time is an arbitrary ordered string (T001, T002...), not real timestamps
+- Game time is integer seconds starting from 0, elapsed_seconds per round decided by LLM
 - All API responses use Chinese for user-facing messages
 - Qdrant runs in local embedded mode (no server needed), with `force_disable_check_same_thread=True` for FastAPI thread pool compatibility
 - SQLite uses WAL mode for concurrent access
