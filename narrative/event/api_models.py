@@ -21,7 +21,6 @@ class NpcDecisionOutput(BaseModel):
     npc_id: str
     npc_name: str
     action: str
-    memory_note: Optional[str] = None
     new_events: list[dict] = Field(default_factory=list)
     goal_changes: list[dict] = Field(default_factory=list)
 

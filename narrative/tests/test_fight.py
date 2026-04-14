@@ -86,7 +86,7 @@ if __name__ == "__main__":
     if scenario == "1":
         print("\n>>> 场景 1: 纯情境 — LLM 自主推演 <<<")
         simulate_scene(
-            description="放学后的学校走廊，张暴和李怯迎面相遇，往常张暴就喜欢欺负李怯",
+            description="放学后的学校走廊，张暴和李怯迎面相遇",
             location="学校",
             characters=["a", "b"],
             intensity=1.0,

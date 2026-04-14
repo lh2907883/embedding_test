@@ -10,24 +10,80 @@ from npc_agent.memory_manager import NpcMemoryManager
 from npc_agent.metadata_store import MetadataStore
 from shared.llm_service import LlmService
 
-SYSTEM_PROMPT = """你是游戏NPC决策引擎。根据NPC的性格、目标、记忆、当前场景，决定NPC的下一步行为。输出简洁的总结性文字，不要写小说。
+MEMORY_SYSTEM_PROMPT = """你是 NPC 记忆生成器。给定一个 NPC 经历的一系列连续事件，从他的第一人称视角生成记忆。
 
 JSON格式：
 {
-  "action": "用一句话概括行为",
-  "elapsed_seconds": 这个行为经过多少秒（整数），
-  "memory_note": "客观记录，一句话",
-  "new_event": null 或 {"description": "一句话描述", "affected_npc_ids": ["被影响NPC的ID"]},
-  "goal_changes": []
+  "memories": [
+    {
+      "content": "记忆叙事文本（第一人称）",
+      "memory_type": "action / affected / witnessed",
+      "game_time": 该记忆对应的游戏时间秒数（整数）
+    }
+  ]
 }
 
 规则：
-- action：一句话，只说做了什么
-- elapsed_seconds：整数秒，合理即可（推人2，逃跑10，打架30）
-- new_event：只有行为实质性改变局面时才填（动手、逃跑找援军），口头行为一律null
-- affected_npc_ids：**必须使用 NPC 的 ID（如 a、b、c），不要使用中文名字**。这个行为直接影响到的NPC ID列表，没有就空数组
-- goal_changes：只记录长期人生目标变化（如"为父报仇"），不记录当场反应
-- 文字尽量简短
+1. 多个连续相关的事件可以合并为一条记忆（如果有前因后果）
+2. 不相关的事件、时间间隔大的事件应该拆成多条记忆
+3. 视角不同：
+   - actor（主导者）：用"我做了..."
+   - affected（被影响者）：用"我被..."或"...发生在我身上"
+   - witnessed（旁观者）：用"我看到..."（描述外在表现，不知内幕）
+4. 旁观者只能记录他能直接观察到的现象，不能推测内幕
+5. 记忆要简洁、有前因后果、客观（不加情绪描写）
+6. game_time 取该段记忆覆盖事件的最后时间点
+"""
+
+
+SYSTEM_PROMPT = """你是游戏剧情推演引擎。每轮你需要为一组在场的 NPC 同时决定他们的行为，输出一个【整体协调一致】的剧情阶段。
+
+JSON格式：
+{
+  "round_event": {
+    "description": "本轮发生了什么的整体描述（一句话）",
+    "actor_npc_id": "本轮主导者的ID（推动剧情的那个人）",
+    "affected_npc_ids": ["被这个事件直接影响的NPC的ID列表"]
+  },
+  "elapsed_seconds": 本轮经过的秒数（整数）,
+  "npc_actions": [
+    {"npc_id": "a", "action": "一句话描述"},
+    {"npc_id": "b", "action": "一句话描述"}
+  ],
+  "should_continue": true/false,
+  "goal_changes": [
+    {"npc_id": "a", "action": "add/complete/abandon", "description": "...", "goal_type": "long_term", "priority": 5}
+  ]
+}
+
+**核心原则：每一轮 = 一次格局变化，不是一个动作**
+
+一轮不是"A 推了 B"或"C 上前阻拦"这样的单个动作，而是一个完整的**格局变化阶段**，
+包含从发起到局面转变的全过程（可能涉及多个 NPC 的连续动作）。
+
+**格局变化**意味着：参与者的关系、位置、状态、力量对比发生了变化。
+
+举例（学校冲突场景正确的两轮划分）：
+- 第 1 轮："张暴打李怯，王正介入阻止，李怯趁机逃跑"
+  → 格局从"三人对峙"变为"李怯脱离，张暴和王正对峙"
+- 第 2 轮："张暴和王正扭打，最终被路过的老师制止"
+  → 格局从"两人打斗"变为"冲突结束"
+
+错误的划分（太细，每轮只是一个动作）：
+❌ "张暴推了李怯" → "王正上前阻止" → "张暴推开王正" → "李怯逃跑" → ...
+
+**should_continue 判断：**
+- 格局已经发生了一次变化 → 当前轮结束。如果还有未稳定的冲突 → true（进入下一轮）
+- 局势已经完全稳定（冲突结束、所有人达成新状态、无人再行动） → false
+
+**其他规则：**
+1. 所有 NPC 行为必须互相协调，不能矛盾
+2. NPC 行为基于性格和记忆
+3. **只能使用在场人物列表中已有的 NPC，禁止凭空引入新角色**（不能编出"路过的老师""巡逻的警卫"等不在列表中的人物）
+4. actor_npc_id / affected_npc_ids / npc_actions[].npc_id：必须用 ID，不能用名字
+4. elapsed_seconds：整个阶段的时长（包含中间的追逐、打斗、逃跑等过程）
+5. goal_changes：只记录长期人生目标变化，不记当场反应
+6. 文字简短，不写小说
 """
 
 
@@ -63,132 +119,177 @@ class DecisionEngine:
         if preset_event:
             _log(f"预设事件: {preset_event.description} (actor={preset_event.actor_npc_id}, affected={preset_event.affected_npc_ids})")
 
+        in_scene_npcs = self._get_scene_npcs(location, intensity, characters)
         rounds = []
-        affected_npcs = self._get_scene_npcs(location, intensity, characters)
+        round_events = []  # 收集所有 round_event 用于最后生成视角记忆
+        prev_round_event = None
+        current_time = game_time
 
+        # 预设事件作为第一个事件加入序列
         if preset_event:
-            # 分支 B：预设事件 — 直接写记忆，然后决策反应
-            self._write_event_memories(
-                event_description=preset_event.description,
-                location=location,
-                game_time=game_time,
-                actor_npc_id=preset_event.actor_npc_id,
-                affected_npc_ids=preset_event.affected_npc_ids,
-                in_scene_npcs=affected_npcs,
-            )
-            # 塞入 pending，进入循环。actor 本轮不再重复决策
-            pending_events = [{
+            round_events.append({
+                "game_time": current_time,
                 "description": preset_event.description,
-                "location": location,
-                "intensity": intensity,
                 "actor_npc_id": preset_event.actor_npc_id,
                 "affected_npc_ids": preset_event.affected_npc_ids,
-                "game_time": game_time,
-                "scene_context": description,
-                "skip_actor_decision": True,
-            }]
-        else:
-            # 分支 A：纯场景 — 每个 NPC 根据场景背景自行决策
-            pending_events = [{
-                "description": "",  # 没有当前事件
-                "location": location,
-                "intensity": intensity,
-                "actor_npc_id": None,
-                "affected_npc_ids": [],
-                "game_time": game_time,
-                "scene_context": description,
-                "is_scene_init": True,
-                "initial_npcs": affected_npcs,  # 初始决策的 NPC
-            }]
+            })
+            prev_round_event = {
+                "description": preset_event.description,
+                "actor_npc_id": preset_event.actor_npc_id,
+                "affected_npc_ids": preset_event.affected_npc_ids,
+            }
 
-        self._run_decision_loop(pending_events, rounds)
+        # 决策循环（不写记忆，只收集事件）
+        for round_num in range(1, MAX_DECISION_ROUNDS + 1):
+            _log(f"\n---------- 第 {round_num} 轮 ----------")
+
+            round_data = self._decide_round(
+                scene_context=description,
+                location=location,
+                in_scene_npcs=in_scene_npcs,
+                game_time=current_time,
+                prev_round_event=prev_round_event,
+            )
+            if not round_data:
+                _log(f"决策失败，循环结束")
+                break
+
+            elapsed = round_data["elapsed_seconds"]
+            new_time = current_time + elapsed
+            re = round_data["round_event"]
+            _log(f"  事件: {re['description']} (+{elapsed}s → {new_time}s)")
+            _log(f"  actor: {re['actor_npc_id']} | affected: {re['affected_npc_ids']}")
+            for a in round_data["npc_actions"]:
+                npc = self._meta.get_npc(a["npc_id"])
+                name = npc["name"] if npc else a["npc_id"]
+                _log(f"    [{name}] {a['action']}")
+
+            # 收集事件
+            round_events.append({
+                "game_time": new_time,
+                "description": re["description"],
+                "actor_npc_id": re["actor_npc_id"],
+                "affected_npc_ids": re["affected_npc_ids"],
+            })
+
+            # 处理目标变更
+            for gc in round_data.get("goal_changes", []):
+                self._apply_goal_change(gc, new_time)
+
+            decisions = [
+                NpcDecisionOutput(
+                    npc_id=a["npc_id"],
+                    npc_name=(self._meta.get_npc(a["npc_id"]) or {}).get("name", a["npc_id"]),
+                    action=a["action"],
+                    new_events=[],
+                    goal_changes=[],
+                )
+                for a in round_data["npc_actions"]
+            ]
+            rounds.append(RoundResult(
+                round=round_num,
+                event_description=re["description"],
+                decisions=decisions,
+            ))
+
+            current_time = new_time
+            prev_round_event = re
+
+            if not round_data.get("should_continue", False):
+                _log(f"剧情自然结束")
+                break
+
+        # 场景结束后，为每个 NPC 生成视角记忆
+        if round_events:
+            _log(f"\n---------- 生成视角记忆 ----------")
+            for npc_id in in_scene_npcs:
+                self._generate_perspective_memories(npc_id, round_events, location)
+
         _log(f"\n========== 场景推演结束，共 {len(rounds)} 轮 ==========\n")
         return rounds
 
-    # ── 决策循环 ──
+    # ── 单轮决策 ──
 
-    def _run_decision_loop(self, pending_events: list[dict], rounds: list[RoundResult]):
-        for round_num in range(1, MAX_DECISION_ROUNDS + 1):
-            if not pending_events:
-                _log(f"没有新事件，循环结束")
-                break
+    def _decide_round(
+        self,
+        scene_context: str,
+        location: str,
+        in_scene_npcs: list[str],
+        game_time: int,
+        prev_round_event: Optional[dict],
+    ) -> Optional[dict]:
+        # 收集所有在场 NPC 的信息
+        npcs_info_text = []
+        for npc_id in in_scene_npcs:
+            npc = self._meta.get_npc(npc_id)
+            if not npc:
+                continue
+            goals = self._meta.list_goals(npc_id, status="active")
+            goals_text = "; ".join(f"{g['description']}" for g in goals) or "无"
 
-            _log(f"\n---------- 第 {round_num} 轮 ----------")
+            # 检索相关记忆
+            query = (prev_round_event or {}).get("description") or scene_context
+            memories = self._memory.search_memories(npc_id, query, top_k=5)
+            mem_text = "; ".join(f"[{m.game_time}s][{m.memory_type}]{m.content[:50]}" for m in memories) or "无"
 
-            all_decisions = []
-            all_new_events = []
-            decided_this_round = set()
-            round_event_desc = "; ".join(
-                e.get("description") or e.get("scene_context", "")[:40] for e in pending_events
+            npcs_info_text.append(
+                f"### {npc_id}: {npc['name']}\n"
+                f"  性格: {npc['personality']}\n"
+                f"  特征: {json.dumps(npc.get('traits', {}), ensure_ascii=False)}\n"
+                f"  目标: {goals_text}\n"
+                f"  相关记忆: {mem_text}"
             )
 
-            for event in pending_events:
-                desc = event.get("description") or "(场景起始)"
-                _log(f"\n事件: {desc}")
+        prev_section = ""
+        if prev_round_event:
+            prev_section = f"""
+## 上一轮发生的事件
+{prev_round_event['description']}
+发起者: {prev_round_event.get('actor_npc_id', '')}
+被影响者: {', '.join(prev_round_event.get('affected_npc_ids', []))}
+"""
 
-                # 确定需要决策的 NPC 列表
-                if event.get("is_scene_init"):
-                    npcs_to_decide = event["initial_npcs"]
-                    _log(f"  场景初始决策 NPC: {npcs_to_decide}")
-                else:
-                    scene_npcs = self._get_scene_npcs(
-                        event["location"], event["intensity"],
-                        [event["actor_npc_id"]] + event.get("affected_npc_ids", [])
-                        if event.get("actor_npc_id") else event.get("affected_npc_ids", []),
-                    )
-                    npcs_to_decide = scene_npcs
-                    _log(f"  actor: {event.get('actor_npc_id')} | affected: {event.get('affected_npc_ids')} | 在场: {scene_npcs}")
+        user_prompt = f"""## 场景
+{scene_context}
+地点: {location}
+当前时间: {game_time}秒
 
-                if not npcs_to_decide:
-                    continue
+## 在场 NPC（共 {len(in_scene_npcs)} 人）
+{chr(10).join(npcs_info_text)}
+{prev_section}
 
-                # 非场景初始化且非预设事件时，写入新事件的记忆（由 LLM 决策产生）
-                if not event.get("is_scene_init") and not event.get("memories_written"):
-                    self._write_event_memories(
-                        event_description=event["description"],
-                        location=event["location"],
-                        game_time=event["game_time"],
-                        actor_npc_id=event.get("actor_npc_id"),
-                        affected_npc_ids=event.get("affected_npc_ids", []),
-                        in_scene_npcs=npcs_to_decide,
-                        skip_actor=True,  # actor 已通过 memory_note 写过 action 记忆，不重复
-                    )
+请决定本轮（一个完整剧情阶段）发生什么。所有 NPC 的行为必须互相协调一致，不能矛盾。
+如果剧情已经稳定（如冲突结束、所有人达成新状态），should_continue 设为 false。"""
 
-                # 决策
-                for npc_id in npcs_to_decide:
-                    if npc_id in decided_this_round:
-                        continue
-                    # 预设事件的 actor 本轮跳过决策
-                    if event.get("skip_actor_decision") and npc_id == event.get("actor_npc_id"):
-                        continue
+        try:
+            result = self._llm.decide(SYSTEM_PROMPT, user_prompt)
+            re = result.get("round_event", {})
+            if not re.get("description"):
+                return None
 
-                    npc = self._meta.get_npc(npc_id)
-                    if not npc:
-                        continue
+            # 过滤非法的 NPC ID
+            actor = re.get("actor_npc_id")
+            if actor and not self._meta.get_npc(actor):
+                actor = None
+            re["actor_npc_id"] = actor
+            re["affected_npc_ids"] = [
+                nid for nid in re.get("affected_npc_ids", []) or []
+                if self._meta.get_npc(nid)
+            ]
 
-                    decision, elapsed = self._decide_for_npc(npc, event)
-                    if decision:
-                        decided_this_round.add(npc_id)
-                        all_decisions.append(decision)
-                        new_time = event["game_time"] + elapsed
-                        _log(f"  {npc['name']}({npc_id}): {decision.action} (+{elapsed}s → {new_time}s)")
-
-                        new_event = self._process_decision(
-                            npc_id, decision, new_time, event["location"]
-                        )
-                        if new_event:
-                            _log(f"    → 新事件: {new_event['description']}")
-                            all_new_events.append(new_event)
-
-            if all_decisions:
-                rounds.append(RoundResult(
-                    round=round_num,
-                    event_description=round_event_desc,
-                    decisions=all_decisions,
-                ))
-
-            pending_events = all_new_events
-            _log(f"\n  本轮 {len(all_decisions)} 个决策，产生 {len(all_new_events)} 个新事件")
+            return {
+                "round_event": re,
+                "elapsed_seconds": int(result.get("elapsed_seconds", 5)),
+                "npc_actions": [
+                    a for a in result.get("npc_actions", [])
+                    if a.get("npc_id") and self._meta.get_npc(a["npc_id"])
+                ],
+                "should_continue": result.get("should_continue", False),
+                "goal_changes": result.get("goal_changes", []),
+            }
+        except Exception as e:
+            _log(f"  ❌ LLM 决策失败: {e}")
+            return None
 
     # ── 辅助 ──
 
@@ -211,14 +312,12 @@ class DecisionEngine:
         actor_npc_id: Optional[str],
         affected_npc_ids: list[str],
         in_scene_npcs: list[str],
-        skip_actor: bool = False,
     ):
         """给一个事件写入记忆：actor → action, affected → affected, 其他在场 → witnessed"""
         gt = str(game_time)
         related = [nid for nid in ([actor_npc_id] if actor_npc_id else []) + affected_npc_ids if nid]
 
-        # actor 写 action
-        if actor_npc_id and not skip_actor and self._meta.get_npc(actor_npc_id):
+        if actor_npc_id and self._meta.get_npc(actor_npc_id):
             self._memory.add_memory(actor_npc_id, AddMemoryRequest(
                 game_time=gt,
                 content=event_description,
@@ -227,7 +326,6 @@ class DecisionEngine:
                 related_npc_ids=related,
             ))
 
-        # affected 写 affected
         for npc_id in affected_npc_ids:
             if self._meta.get_npc(npc_id):
                 self._memory.add_memory(npc_id, AddMemoryRequest(
@@ -238,7 +336,6 @@ class DecisionEngine:
                     related_npc_ids=related,
                 ))
 
-        # 其他在场者写 witnessed
         participants = set(related)
         bystanders = [nid for nid in in_scene_npcs if nid not in participants]
         for npc_id in bystanders:
@@ -250,133 +347,88 @@ class DecisionEngine:
                 related_npc_ids=related,
             ))
 
-    def _decide_for_npc(self, npc: dict, event: dict) -> tuple[NpcDecisionOutput | None, int]:
-        npc_id = npc["npc_id"]
+    def _generate_perspective_memories(self, npc_id: str, round_events: list[dict], location: str):
+        """根据所有 round_events 为指定 NPC 生成视角记忆"""
+        npc = self._meta.get_npc(npc_id)
+        if not npc:
+            return
 
-        goals = self._meta.list_goals(npc_id, status="active")
-        goals_text = "\n".join(f"- [{g['goal_type']}] {g['description']}（优先级{g['priority']}）" for g in goals)
-        if not goals_text:
-            goals_text = "（暂无目标）"
+        # 为该 NPC 列出每个事件中他的角色和能感知的内容
+        events_text = []
+        for i, evt in enumerate(round_events, 1):
+            actor = evt.get("actor_npc_id")
+            affected = evt.get("affected_npc_ids", [])
+            if npc_id == actor:
+                role = "actor（你是发起者）"
+            elif npc_id in affected:
+                role = "affected（你是被影响者）"
+            else:
+                role = "witnessed（你是旁观者，只能看到外在表现）"
+            events_text.append(
+                f"事件{i}（{evt['game_time']}秒）: {evt['description']}\n"
+                f"  你的角色: {role}"
+            )
 
-        query = event.get("description") or event.get("scene_context", "")
-        memories = self._memory.search_memories(npc_id, query, top_k=10)
-        memories_text = "\n".join(
-            f"- [{m.game_time}] ({m.memory_type}): {m.content}" for m in memories
-        )
-        if not memories_text:
-            memories_text = "（没有相关记忆）"
-
-        scene_context = event.get("scene_context", "")
-        event_desc = event.get("description", "")
-
-        # 列出在场 NPC 的 ID → 名字 映射
-        in_scene_npcs = self._get_scene_npcs(event["location"], 1.0, [])
-        npc_list_text = "\n".join(
-            f"- {n['npc_id']}: {n['name']}"
-            for n in [self._meta.get_npc(nid) for nid in in_scene_npcs]
-            if n
-        )
-
-        event_section = ""
-        if event_desc:
-            event_section = f"""
-## 当前发生的事件
-时间: {event['game_time']}秒
-事件: {event_desc}"""
-            if event.get("actor_npc_id"):
-                event_section += f"\n发起者: {event['actor_npc_id']}"
-            if event.get("affected_npc_ids"):
-                event_section += f"\n被影响者: {', '.join(event['affected_npc_ids'])}"
-
-        user_prompt = f"""## NPC信息
+        user_prompt = f"""## 你是谁
 ID: {npc_id}
 姓名: {npc['name']}
 性格: {npc['personality']}
-特征: {json.dumps(npc.get('traits', {}), ensure_ascii=False)}
-当前位置: {npc.get('location', '未知')}
 
-## 当前目标
-{goals_text}
+## 你刚刚经历的事件序列
+{chr(10).join(events_text)}
 
-## 相关记忆
-{memories_text}
-
-## 场景背景
-时间: {event['game_time']}秒
-地点: {event['location']}
-场景: {scene_context}
-{event_section}
-
-## 在场人物（ID 对照）
-{npc_list_text}
-
-请决定{npc['name']}的下一步行为。new_event 的 affected_npc_ids 必须使用上方的 ID。"""
+请从你的第一人称视角生成你对这件事的记忆。
+- 连续相关的事件可以合并为一条记忆
+- 不相关或时间跨度大的事件拆成多条
+- 旁观者不能描述内幕，只能说看到的外在表现
+"""
 
         try:
-            result = self._llm.decide(SYSTEM_PROMPT, user_prompt)
-            elapsed = int(result.get("elapsed_seconds", 5))
-
-            new_events = []
-            new_event = result.get("new_event")
-            if new_event and isinstance(new_event, dict) and new_event.get("description"):
-                new_events = [new_event]
-
-            return NpcDecisionOutput(
-                npc_id=npc_id,
-                npc_name=npc["name"],
-                action=result.get("action", "无反应"),
-                memory_note=result.get("memory_note"),
-                new_events=new_events,
-                goal_changes=result.get("goal_changes", []),
-            ), elapsed
-        except Exception as e:
-            _log(f"  ❌ LLM 决策失败: {e}")
-            return None, 0
-
-    def _process_decision(self, npc_id: str, decision: NpcDecisionOutput,
-                          game_time: int, location: str) -> dict | None:
-        # 写 action 记忆（决策者自身）
-        if decision.memory_note:
-            self._memory.add_memory(npc_id, AddMemoryRequest(
-                game_time=str(game_time),
-                content=decision.memory_note,
-                memory_type=MemoryType.ACTION,
-                location=location,
+            result = self._llm.decide(MEMORY_SYSTEM_PROMPT, user_prompt)
+            memories = result.get("memories", [])
+            related = list(set(
+                [evt.get("actor_npc_id") for evt in round_events if evt.get("actor_npc_id")] +
+                [nid for evt in round_events for nid in evt.get("affected_npc_ids", [])]
             ))
+            for m in memories:
+                content = m.get("content", "")
+                if not content:
+                    continue
+                mtype_str = m.get("memory_type", "witnessed")
+                try:
+                    mtype = MemoryType(mtype_str)
+                except ValueError:
+                    mtype = MemoryType.WITNESSED
+                gt = str(m.get("game_time", round_events[-1]["game_time"]))
+                self._memory.add_memory(npc_id, AddMemoryRequest(
+                    game_time=gt,
+                    content=content,
+                    memory_type=mtype,
+                    location=location,
+                    related_npc_ids=related,
+                ))
+            _log(f"  {npc['name']}({npc_id}): 生成 {len(memories)} 条视角记忆")
+        except Exception as e:
+            _log(f"  ❌ {npc['name']} 视角记忆生成失败: {e}")
 
-        # 处理目标变更
-        for gc in decision.goal_changes:
-            action = gc.get("action")
-            if action == "add":
-                goal_id = str(uuid.uuid4())[:8]
-                self._meta.create_goal(
-                    goal_id, npc_id,
-                    gc.get("goal_type", "long_term"),
-                    gc.get("description", ""),
-                    gc.get("priority", 5),
-                    str(game_time), None,
-                )
-            elif action in ("complete", "abandon"):
-                goals = self._meta.list_goals(npc_id, status="active")
-                for g in goals:
-                    if gc.get("description", "") in g["description"]:
-                        status = "completed" if action == "complete" else "abandoned"
-                        self._meta.update_goal(g["goal_id"], status=status)
-                        break
-
-        # 返回新事件（location/intensity 由系统维持，不采信 LLM 输出）
-        if decision.new_events:
-            evt = decision.new_events[0]
-            # 过滤非法的 affected_npc_ids（必须是有效 NPC）
-            raw_affected = evt.get("affected_npc_ids", []) or []
-            affected_ids = [nid for nid in raw_affected if self._meta.get_npc(nid)]
-            return {
-                "description": evt.get("description", ""),
-                "location": location,
-                "intensity": 1.0,
-                "actor_npc_id": npc_id,
-                "affected_npc_ids": affected_ids,
-                "game_time": game_time,
-                "scene_context": "",
-            }
-        return None
+    def _apply_goal_change(self, gc: dict, game_time: int):
+        npc_id = gc.get("npc_id")
+        if not npc_id or not self._meta.get_npc(npc_id):
+            return
+        action = gc.get("action")
+        if action == "add":
+            goal_id = str(uuid.uuid4())[:8]
+            self._meta.create_goal(
+                goal_id, npc_id,
+                gc.get("goal_type", "long_term"),
+                gc.get("description", ""),
+                gc.get("priority", 5),
+                str(game_time), None,
+            )
+        elif action in ("complete", "abandon"):
+            goals = self._meta.list_goals(npc_id, status="active")
+            for g in goals:
+                if gc.get("description", "") in g["description"]:
+                    status = "completed" if action == "complete" else "abandoned"
+                    self._meta.update_goal(g["goal_id"], status=status)
+                    break
